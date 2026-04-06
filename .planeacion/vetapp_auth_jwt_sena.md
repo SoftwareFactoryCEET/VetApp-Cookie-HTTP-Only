@@ -36,7 +36,7 @@
    - [Paso 11: Servicios](#-paso-11--servicios-punto-de-swap-entre-implementaciones)
    - [Paso 12: Hook useAuth](#-paso-12--hook-useauth--el-corazón-del-frontend)
    - [Paso 13: Componentes de UI y guards](#-paso-13--componentes-de-ui-y-guards-de-roles)
-   - [Paso 14: Middleware de rutas](#-paso-14--middleware-de-protección-de-rutas)
+   - [Paso 14: Protección de rutas (proxy.ts)](#-paso-14--protección-de-rutas-con-proxysts)
    - [Paso 15: Páginas y layout](#-paso-15--páginas-y-layout)
 7. [PARTE 4 – Pruebas del flujo completo](#parte-4--pruebas-del-flujo-completo)
 8. [Diagrama del flujo completo](#8-diagrama-del-flujo-completo-de-autenticación)
@@ -64,7 +64,7 @@
 - Implementar Row Level Security (RLS) en PostgreSQL para proteger datos.
 - Aplicar el patrón Repositorio para desacoplar la lógica de autenticación.
 - Construir una interfaz Next.js con renderizado condicional según el rol del usuario.
-- Proteger rutas con middleware de Next.js leyendo el JWT desde cookies.
+- Proteger rutas con `proxy.ts` de Next.js 16 leyendo el JWT desde cookies.
 
 > **Concepto clave: JWT (JSON Web Token)**  
 > Un JWT es un token firmado criptográficamente que contiene información (claims) sobre el usuario.  
@@ -104,48 +104,47 @@ El sistema maneja dos tablas principales en Supabase, además de `auth.users`:
 El proyecto sigue el **Patrón Repositorio** que separa claramente las capas:
 
 ```
-vetapp/
 src/
 ├── lib/
 │   └── supabase/
-│       ├── clients.ts          ← Clientes browser/server (SSR)
-│       └── server.ts
+│       ├── clients.ts          ← Cliente browser con cookies HTTP-only
+│       └── server.ts           ← Cliente SSR para Server Components
 ├── types/
 │   └── domain/
-│       ├── profile.schema.ts   ← Tipos + validación Zod (rol, usuario)
+│       ├── profile.schema.ts   ← Tipos + validación Zod (rol, sesión)
 │       └── paciente.schema.ts  ← Tipos + validación Zod (paciente)
 ├── repositories/
 │   ├── IAuthRepository.ts      ← Contrato de autenticación
-│   ├── IProfileRepository.ts   ← Contrato de perfiles
 │   ├── IPacienteRepository.ts  ← Contrato de pacientes
 │   └── supabase/
-│       ├── AuthRepository.ts   ← Implementación Supabase Auth
-│       ├── ProfileRepository.ts
+│       ├── AuthRepository.ts   ← Implementación Supabase Auth + decodeJwt
 │       └── PacienteRepository.ts
 ├── services/
-│   ├── authService.ts          ← Orquestador de auth (punto de swap)
-│   ├── profileService.ts
+│   ├── authService.ts          ← Punto de swap de implementación
 │   └── pacienteService.ts
 ├── hooks/
-│   ├── useAuth.ts              ← Hook global (user, role, isAdmin...)
-│   └── usePacientes.ts
+│   ├── useAuth.ts              ← Hook global (session, isAdmin, hasRole…)
+│   └── usePacientes.ts         ← CRUD de pacientes con estado
 ├── components/
 │   ├── RoleGuard.tsx           ← Renderizado condicional por rol
 │   └── NavBar.tsx
 ├── app/
 │   ├── layout.tsx
+│   ├── page.tsx                ← Página pública de inicio
 │   ├── login/page.tsx
-│   ├── register/page.tsx
-│   ├── pacientes/page.tsx
+│   ├── registro/page.tsx       ← Registro (ruta en español)
+│   ├── pacientes/
+│   │   ├── page.tsx
+│   │   └── nuevo/page.tsx      ← Crear paciente (admin/vet)
 │   └── admin/page.tsx
-└── middleware.ts               ← Protección de rutas a nivel servidor
+└── proxy.ts                    ← Protección de rutas (reemplaza middleware en Next.js 16)
 ```
 
 > **Flujo completo de una petición autenticada:**
 > 1. El usuario hace login → Supabase genera un JWT firmado.
 > 2. El Custom Hook inyecta `user_role` en el payload del JWT.
 > 3. El JWT se almacena en cookies HTTP-only (gestionado por `@supabase/ssr`).
-> 4. En cada petición, el middleware de Next.js valida la sesión y el rol.
+> 4. En cada petición, `proxy.ts` valida la sesión y el rol antes de renderizar.
 > 5. El frontend lee el rol desde el JWT (sin query extra a la DB).
 > 6. Supabase evalúa el RLS en cada query SQL según `auth.jwt()->>'user_role'`.
 > 7. Solo llegan al cliente los datos que le corresponden según su rol.
@@ -558,15 +557,36 @@ import { UserSessionSchema } from '@/types/domain/profile.schema'
 import type { IAuthRepository } from '../IAuthRepository'
 import type { UserSession } from '@/types/domain/profile.schema'
 
-function parseSession(user: any): UserSession | null {
+/* ============================================================
+   El user_role se lee decodificando el JWT access_token,
+   donde el Custom Access Token Hook lo inyecta como claim
+   de primer nivel (NO está en app_metadata).
+   ============================================================ */
+
+/** Decodifica el payload del JWT sin verificar la firma (solo lectura de claims) */
+function decodeJwt(token: string): Record<string, unknown> {
+  try {
+    return JSON.parse(atob(token.split('.')[1]))
+  } catch {
+    return {}
+  }
+}
+
+/** Construye una UserSession a partir del user y el access_token */
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function parseSession(user: any, accessToken?: string): UserSession | null {
   if (!user) return null
   try {
+    const claims = accessToken ? decodeJwt(accessToken) : {}
     return UserSessionSchema.parse({
       id:        user.id,
       email:     user.email,
-      user_role: user.app_metadata?.user_role ?? 'owner',
+      // El Custom Access Token Hook inyecta user_role en los claims del JWT
+      user_role: claims.user_role ?? user.app_metadata?.user_role ?? 'owner',
     })
-  } catch { return null }
+  } catch {
+    return null
+  }
 }
 
 export class SupabaseAuthRepository implements IAuthRepository {
@@ -576,13 +596,17 @@ export class SupabaseAuthRepository implements IAuthRepository {
     const { data, error } = await this.supabase.auth
       .signInWithPassword({ email, password })
     if (error) return { session: null, error: error.message }
-    return { session: parseSession(data.user), error: null }
+    return {
+      session: parseSession(data.user, data.session?.access_token),
+      error: null,
+    }
   }
 
   async signUp(email: string, password: string, fullName?: string) {
     const { error } = await this.supabase.auth.signUp({
-      email, password,
-      options: { data: { full_name: fullName ?? '' } }
+      email,
+      password,
+      options: { data: { full_name: fullName ?? '' } },
     })
     return { error: error?.message ?? null }
   }
@@ -592,13 +616,17 @@ export class SupabaseAuthRepository implements IAuthRepository {
   }
 
   async getCurrentSession(): Promise<UserSession | null> {
-    const { data: { user } } = await this.supabase.auth.getUser()
-    return parseSession(user)
+    // getSession() devuelve el access_token con los custom claims del JWT
+    const { data: { session } } = await this.supabase.auth.getSession()
+    if (!session) return null
+    return parseSession(session.user, session.access_token)
   }
 
   onAuthStateChange(cb: (session: UserSession | null) => void) {
     const { data: { subscription } } = this.supabase.auth
-      .onAuthStateChange((_, session) => cb(parseSession(session?.user)))
+      .onAuthStateChange((_, session) => {
+        cb(session ? parseSession(session.user, session.access_token) : null)
+      })
     return () => subscription.unsubscribe()
   }
 }
@@ -739,8 +767,10 @@ export function useAuth() {
 
   const signIn = useCallback(async (email: string, password: string) => {
     setError(null)
-    const { error } = await authService.signIn(email, password)
+    const { session, error } = await authService.signIn(email, password)
     if (error) setError(error)
+    if (session) setSession(session)
+    return { error }
   }, [])
 
   const signUp = useCallback(async (
@@ -749,6 +779,7 @@ export function useAuth() {
     setError(null)
     const { error } = await authService.signUp(email, password, fullName)
     if (error) setError(error)
+    return { error }
   }, [])
 
   const signOut = useCallback(async () => {
@@ -776,6 +807,78 @@ export function useAuth() {
   }
 }
 ```
+
+---
+
+### 🟩 Paso 12b — Hook `usePacientes` – gestión de pacientes
+
+**`src/hooks/usePacientes.ts`**
+
+```typescript
+'use client'
+import { useState, useEffect, useCallback } from 'react'
+import { pacienteService } from '@/services/pacienteService'
+import { useAuth } from '@/hooks/useAuth'
+import type { Paciente, CreatePaciente } from '@/types/domain/paciente.schema'
+
+/* ============================================================
+   HOOK: usePacientes
+   Gestiona el estado de la lista de pacientes y expone CRUD.
+   El RLS filtra automáticamente según el rol del usuario.
+   Limpia los datos cuando el usuario cierra sesión (seguridad).
+   ============================================================ */
+
+export function usePacientes() {
+  const { isAuthenticated } = useAuth()
+  const [pacientes, setPacientes] = useState<Paciente[]>([])
+  const [cargando,  setCargando]  = useState(true)
+  const [error,     setError]     = useState<string | null>(null)
+
+  const cargar = useCallback(async () => {
+    setCargando(true)
+    setError(null)
+    try {
+      const datos = await pacienteService.listar()
+      setPacientes(datos)
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Error al cargar pacientes')
+    } finally {
+      setCargando(false)
+    }
+  }, [])
+
+  useEffect(() => {
+    if (!isAuthenticated) {
+      // Limpiar datos al cerrar sesión — no mostrar información de otros usuarios
+      setPacientes([])
+      setCargando(false)
+      return
+    }
+    cargar()
+  }, [isAuthenticated, cargar])
+
+  const crear = useCallback(async (data: CreatePaciente) => {
+    const nuevo = await pacienteService.crear(data)
+    setPacientes(prev => [nuevo, ...prev])
+    return nuevo
+  }, [])
+
+  const editar = useCallback(async (id: string, data: Partial<CreatePaciente>) => {
+    const actualizado = await pacienteService.editar(id, data)
+    setPacientes(prev => prev.map(p => p.id === id ? actualizado : p))
+    return actualizado
+  }, [])
+
+  const eliminar = useCallback(async (id: string) => {
+    await pacienteService.eliminar(id)
+    setPacientes(prev => prev.filter(p => p.id !== id))
+  }, [])
+
+  return { pacientes, cargando, error, recargar: cargar, crear, editar, eliminar }
+}
+```
+
+> **Seguridad post-logout:** Al detectar que `isAuthenticated` pasa a `false`, el hook borra inmediatamente el array de pacientes. Esto evita que, si dos usuarios distintos usan el mismo navegador, el segundo vea los datos del primero antes de que el nuevo fetch termine.
 
 ---
 
@@ -855,16 +958,18 @@ export default function NavBar() {
 
 ---
 
-### 🟩 Paso 14 — Middleware de protección de rutas
+### 🟩 Paso 14 — Protección de rutas con `proxy.ts`
 
-**`src/middleware.ts`**
+> **Cambio en Next.js 16:** En esta versión, el archivo `middleware.ts` fue reemplazado por `proxy.ts`. La función exportada se llama `proxy` (no `middleware`) y devuelve una promesa encadenada con `.then()`. El `matcher` también aplica sobre todas las rutas, excluyendo assets estáticos.
+
+**`src/proxy.ts`**
 
 ```typescript
 import { createServerClient } from '@supabase/ssr'
 import { NextResponse } from 'next/server'
 import type { NextRequest } from 'next/server'
 
-export async function middleware(req: NextRequest) {
+export function proxy(req: NextRequest) {
   let res = NextResponse.next({ request: req })
 
   const supabase = createServerClient(
@@ -878,34 +983,42 @@ export async function middleware(req: NextRequest) {
             req.cookies.set(name, value)
             res.cookies.set(name, value, options)
           })
-        }
-      }
+        },
+      },
     }
   )
 
-  const { data: { user } } = await supabase.auth.getUser()
-  const pathname = req.nextUrl.pathname
+  // Usar getUser() (no getSession()) para validar la sesión en el servidor
+  return supabase.auth.getUser().then(({ data: { user } }) => {
+    const pathname = req.nextUrl.pathname
 
-  const protectedRoutes = ['/pacientes', '/admin']
-  const isProtected = protectedRoutes.some(r => pathname.startsWith(r))
+    /* ---------- Rutas protegidas que requieren login ---------- */
+    const rutasProtegidas = ['/pacientes', '/admin']
+    const esProtegida = rutasProtegidas.some(r => pathname.startsWith(r))
 
-  if (isProtected && !user)
-    return NextResponse.redirect(new URL('/login', req.url))
+    if (esProtegida && !user)
+      return NextResponse.redirect(new URL('/login', req.url))
 
-  if (pathname.startsWith('/admin')) {
-    const userRole = user?.app_metadata?.user_role
-    if (userRole !== 'admin')
+    /* ---------- /admin solo para administradores ---------- */
+    if (pathname.startsWith('/admin')) {
+      const rolUsuario = user?.app_metadata?.user_role
+      if (rolUsuario !== 'admin')
+        return NextResponse.redirect(new URL('/pacientes', req.url))
+    }
+
+    /* ---------- Redirigir si ya está autenticado ---------- */
+    if ((pathname === '/login' || pathname === '/registro') && user)
       return NextResponse.redirect(new URL('/pacientes', req.url))
-  }
 
-  if ((pathname === '/login' || pathname === '/register') && user)
-    return NextResponse.redirect(new URL('/pacientes', req.url))
-
-  return res
+    return res
+  })
 }
 
 export const config = {
-  matcher: ['/pacientes/:path*', '/admin/:path*', '/login', '/register'],
+  matcher: [
+    // Excluir archivos estáticos y rutas internas de Next.js
+    '/((?!_next/static|_next/image|favicon.ico|.*\\.png$).*)',
+  ],
 }
 ```
 
@@ -941,46 +1054,103 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
 
 ```tsx
 'use client'
-import { useState } from 'react'
+import { useState, FormEvent } from 'react'
 import { useRouter } from 'next/navigation'
+import Link from 'next/link'
 import { useAuth } from '@/hooks/useAuth'
 
 export default function LoginPage() {
-  const [email,    setEmail]    = useState('')
-  const [password, setPassword] = useState('')
-  const { signIn, error, loading } = useAuth()
+  const { signIn, loading } = useAuth()
   const router = useRouter()
 
-  const handleSubmit = async (e: React.FormEvent) => {
+  const [email,    setEmail]    = useState('')
+  const [password, setPassword] = useState('')
+  const [error,    setError]    = useState<string | null>(null)
+  const [enviando, setEnviando] = useState(false)
+
+  async function handleSubmit(e: FormEvent) {
     e.preventDefault()
-    await signIn(email, password)
-    if (!error) router.push('/pacientes')
+    setError(null)
+    setEnviando(true)
+
+    const { error } = await signIn(email, password)
+
+    if (error) {
+      setError(error)
+      setEnviando(false)
+    } else {
+      router.push('/pacientes')
+    }
+  }
+
+  if (loading) {
+    return (
+      <div className="flex justify-center items-center min-h-[60vh]" aria-live="polite">
+        <span className="text-gray-500">Cargando...</span>
+      </div>
+    )
   }
 
   return (
-    <div className="max-w-md mx-auto mt-16">
-      <div className="bg-white rounded-xl shadow-md p-8">
-        <h1 className="text-2xl font-bold text-green-800 mb-6">Iniciar Sesión – VetApp</h1>
-        <form onSubmit={handleSubmit} className="space-y-4">
+    <div className="flex justify-center items-center min-h-[80vh] px-4">
+      <div className="bg-white rounded-xl shadow-md p-8 w-full max-w-md">
+        <h1 className="text-2xl font-bold text-green-800 mb-6 text-center">
+          Iniciar sesión
+        </h1>
+
+        <form onSubmit={handleSubmit} className="flex flex-col gap-4" noValidate>
           <div>
-            <label className="block text-sm font-medium text-gray-700 mb-1">Correo electrónico</label>
-            <input type="email" value={email} onChange={e => setEmail(e.target.value)}
-              className="w-full border rounded-lg px-3 py-2 focus:outline-none focus:ring-2 focus:ring-green-500" required />
+            <label htmlFor="email" className="block text-sm font-medium text-gray-700 mb-1">
+              Correo electrónico
+            </label>
+            <input
+              id="email"
+              type="email"
+              value={email}
+              onChange={e => setEmail(e.target.value)}
+              required
+              autoComplete="email"
+              className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-green-600"
+              placeholder="tu@email.com"
+            />
           </div>
+
           <div>
-            <label className="block text-sm font-medium text-gray-700 mb-1">Contraseña</label>
-            <input type="password" value={password} onChange={e => setPassword(e.target.value)}
-              className="w-full border rounded-lg px-3 py-2 focus:outline-none focus:ring-2 focus:ring-green-500" required />
+            <label htmlFor="password" className="block text-sm font-medium text-gray-700 mb-1">
+              Contraseña
+            </label>
+            <input
+              id="password"
+              type="password"
+              value={password}
+              onChange={e => setPassword(e.target.value)}
+              required
+              autoComplete="current-password"
+              className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-green-600"
+              placeholder="••••••••"
+            />
           </div>
-          {error && <p className="text-red-600 text-sm bg-red-50 p-2 rounded">{error}</p>}
-          <button type="submit" disabled={loading}
-            className="w-full bg-green-700 text-white py-2 rounded-lg hover:bg-green-800 disabled:opacity-50">
-            {loading ? 'Cargando...' : 'Entrar'}
+
+          {error && (
+            <p role="alert" className="text-red-600 text-sm bg-red-50 border border-red-200 rounded p-2">
+              {error}
+            </p>
+          )}
+
+          <button
+            type="submit"
+            disabled={enviando}
+            className="bg-green-700 text-white py-2.5 rounded-lg font-medium hover:bg-green-800 transition-colors disabled:opacity-50 disabled:cursor-not-allowed min-h-[44px]"
+          >
+            {enviando ? 'Entrando...' : 'Entrar'}
           </button>
         </form>
-        <p className="mt-4 text-sm text-gray-600 text-center">
+
+        <p className="mt-4 text-center text-sm text-gray-600">
           ¿No tienes cuenta?{' '}
-          <a href="/register" className="text-green-700 hover:underline">Regístrate</a>
+          <Link href="/registro" className="text-green-700 font-medium hover:underline">
+            Regístrate
+          </Link>
         </p>
       </div>
     </div>
@@ -988,108 +1158,478 @@ export default function LoginPage() {
 }
 ```
 
-**`src/app/pacientes/page.tsx`**
+**`src/app/registro/page.tsx`**
 
 ```tsx
 'use client'
-import { useEffect, useState } from 'react'
+import { useState, FormEvent } from 'react'
+import { useRouter } from 'next/navigation'
+import Link from 'next/link'
 import { useAuth } from '@/hooks/useAuth'
-import RoleGuard from '@/components/RoleGuard'
-import { pacienteService } from '@/services/pacienteService'
-import type { Paciente } from '@/types/domain/paciente.schema'
 
-export default function PacientesPage() {
-  const { isAdmin } = useAuth()
-  const [pacientes, setPacientes] = useState<Paciente[]>([])
-  const [loading, setLoading]     = useState(true)
+export default function RegistroPage() {
+  const { signUp } = useAuth()
+  const router = useRouter()
 
-  useEffect(() => {
-    pacienteService.listar().then(setPacientes).finally(() => setLoading(false))
-  }, [])
+  const [nombre,   setNombre]   = useState('')
+  const [email,    setEmail]    = useState('')
+  const [password, setPassword] = useState('')
+  const [error,    setError]    = useState<string | null>(null)
+  const [exito,    setExito]    = useState(false)
+  const [enviando, setEnviando] = useState(false)
 
-  if (loading) return <p className="text-gray-500">Cargando pacientes...</p>
+  async function handleSubmit(e: FormEvent) {
+    e.preventDefault()
+    setError(null)
+    setEnviando(true)
+
+    const { error } = await signUp(email, password, nombre)
+
+    if (error) {
+      setError(error)
+      setEnviando(false)
+    } else {
+      setExito(true)
+      setTimeout(() => router.push('/login'), 3000)
+    }
+  }
+
+  if (exito) {
+    return (
+      <div className="flex justify-center items-center min-h-[80vh] px-4">
+        <div className="bg-green-50 border border-green-200 rounded-xl p-8 text-center max-w-md w-full">
+          <div className="text-4xl mb-3">✅</div>
+          <h2 className="text-xl font-bold text-green-800 mb-2">¡Cuenta creada!</h2>
+          <p className="text-sm text-gray-600">
+            Revisa tu correo para confirmar la cuenta. Redirigiendo al login...
+          </p>
+        </div>
+      </div>
+    )
+  }
 
   return (
-    <div>
-      <div className="flex justify-between items-center mb-6">
-        <h1 className="text-2xl font-bold text-green-800">
-          Pacientes
-          {isAdmin && <span className="ml-2 text-sm text-yellow-600">(Vista Admin)</span>}
-        </h1>
-        <RoleGuard roles={['admin', 'vet']}>
-          <a href="/pacientes/nuevo"
-            className="bg-green-700 text-white px-4 py-2 rounded-lg hover:bg-green-800">
-            + Nuevo paciente
-          </a>
-        </RoleGuard>
-      </div>
+    <div className="flex justify-center items-center min-h-[80vh] px-4">
+      <div className="bg-white rounded-xl shadow-md p-8 w-full max-w-md">
+        <h1 className="text-2xl font-bold text-green-800 mb-6 text-center">Crear cuenta</h1>
 
-      <RoleGuard roles="admin">
-        <div className="bg-yellow-50 border border-yellow-300 rounded-lg p-4 mb-4">
-          <strong>Admin:</strong> Ves todos los pacientes. El RLS devuelve todos los registros para tu rol.
-        </div>
-      </RoleGuard>
+        <form onSubmit={handleSubmit} className="flex flex-col gap-4" noValidate>
+          <div>
+            <label htmlFor="nombre" className="block text-sm font-medium text-gray-700 mb-1">
+              Nombre completo
+            </label>
+            <input id="nombre" type="text" value={nombre} onChange={e => setNombre(e.target.value)}
+              autoComplete="name"
+              className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-green-600"
+              placeholder="Ana García" />
+          </div>
 
-      <div className="grid gap-4">
-        {pacientes.length === 0 ? (
-          <p className="text-gray-500">No hay pacientes registrados.</p>
-        ) : (
-          pacientes.map(p => (
-            <div key={p.id} className="bg-white rounded-xl shadow p-4 flex justify-between">
-              <div>
-                <h2 className="font-semibold text-gray-800">{p.nombre}</h2>
-                <p className="text-sm text-gray-500">{p.especie} | {p.edad_meses} meses</p>
-              </div>
-              <RoleGuard roles={['admin', 'vet']}>
-                <button onClick={() => pacienteService.eliminar(p.id)}
-                  className="text-red-500 text-sm hover:underline">
-                  Eliminar
-                </button>
-              </RoleGuard>
-            </div>
-          ))
-        )}
+          <div>
+            <label htmlFor="email" className="block text-sm font-medium text-gray-700 mb-1">
+              Correo electrónico
+            </label>
+            <input id="email" type="email" value={email} onChange={e => setEmail(e.target.value)}
+              required autoComplete="email"
+              className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-green-600"
+              placeholder="tu@email.com" />
+          </div>
+
+          <div>
+            <label htmlFor="password" className="block text-sm font-medium text-gray-700 mb-1">
+              Contraseña
+            </label>
+            <input id="password" type="password" value={password} onChange={e => setPassword(e.target.value)}
+              required autoComplete="new-password" minLength={6}
+              className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-green-600"
+              placeholder="Mínimo 6 caracteres" />
+          </div>
+
+          {error && (
+            <p role="alert" className="text-red-600 text-sm bg-red-50 border border-red-200 rounded p-2">
+              {error}
+            </p>
+          )}
+
+          <p className="text-xs text-gray-500 bg-gray-50 rounded p-2">
+            Las cuentas nuevas reciben el rol <strong>Propietario</strong> por defecto.
+            Un administrador puede cambiar el rol desde el panel de administración.
+          </p>
+
+          <button type="submit" disabled={enviando}
+            className="bg-green-700 text-white py-2.5 rounded-lg font-medium hover:bg-green-800 transition-colors disabled:opacity-50 disabled:cursor-not-allowed min-h-[44px]">
+            {enviando ? 'Creando cuenta...' : 'Crear cuenta'}
+          </button>
+        </form>
+
+        <p className="mt-4 text-center text-sm text-gray-600">
+          ¿Ya tienes cuenta?{' '}
+          <Link href="/login" className="text-green-700 font-medium hover:underline">
+            Inicia sesión
+          </Link>
+        </p>
       </div>
     </div>
   )
 }
 ```
 
+> **Confirmación por correo:** Supabase envía un email de verificación antes de activar la cuenta. El trigger `handle_new_user()` crea el perfil con rol `owner` en cuanto el usuario es creado en `auth.users`, incluso antes de la confirmación.
+
+---
+
+**`src/app/pacientes/page.tsx`**
+
+```tsx
+'use client'
+import { useEffect } from 'react'
+import { useRouter } from 'next/navigation'
+import { useAuth } from '@/hooks/useAuth'
+import { usePacientes } from '@/hooks/usePacientes'
+import RoleGuard from '@/components/RoleGuard'
+import Link from 'next/link'
+
+/** Etiqueta de especie con color */
+function EspeciaBadge({ especie }: { especie: string }) {
+  const colores: Record<string, string> = {
+    perro:  'bg-yellow-100 text-yellow-800',
+    gato:   'bg-purple-100 text-purple-800',
+    ave:    'bg-sky-100 text-sky-800',
+    conejo: 'bg-pink-100 text-pink-800',
+  }
+  const color = colores[especie.toLowerCase()] ?? 'bg-gray-100 text-gray-700'
+  return (
+    <span className={`text-xs font-medium px-2 py-0.5 rounded-full ${color}`}>
+      {especie}
+    </span>
+  )
+}
+
+export default function PacientesPage() {
+  const { session, isAdmin, isAuthenticated, loading } = useAuth()
+  const { pacientes, cargando, error, eliminar } = usePacientes()
+  const router = useRouter()
+
+  useEffect(() => {
+    if (!loading && !isAuthenticated) router.replace('/login')
+  }, [loading, isAuthenticated, router])
+
+  if (!loading && !isAuthenticated) return null
+  if (cargando) return (
+    <div className="flex justify-center items-center min-h-[50vh]" aria-live="polite">
+      <span className="text-gray-500">Cargando pacientes...</span>
+    </div>
+  )
+  if (error) return (
+    <div role="alert" className="bg-red-50 border border-red-200 rounded-lg p-4 text-red-700 m-6">
+      Error al cargar pacientes: {error}
+    </div>
+  )
+
+  return (
+    <div className="max-w-5xl mx-auto px-4 py-8">
+      <div className="flex justify-between items-center mb-6">
+        <div>
+          <h1 className="text-2xl font-bold text-gray-900">Pacientes</h1>
+          <p className="text-sm text-gray-500 mt-0.5">
+            {pacientes.length} registro{pacientes.length !== 1 ? 's' : ''} visibles para tu rol
+            <span className="ml-1 font-semibold text-green-700">[{session?.user_role}]</span>
+          </p>
+        </div>
+
+        <RoleGuard roles={['admin', 'vet']}>
+          <Link
+            href="/pacientes/nuevo"
+            className="bg-green-700 text-white px-4 py-2 rounded-lg text-sm font-medium hover:bg-green-800 transition-colors min-h-[44px] flex items-center"
+          >
+            + Nuevo paciente
+          </Link>
+        </RoleGuard>
+      </div>
+
+      {pacientes.length === 0 && (
+        <div className="text-center py-16 text-gray-400">
+          <div className="text-5xl mb-3">🐾</div>
+          <p className="text-lg">No hay pacientes registrados aún.</p>
+        </div>
+      )}
+
+      {pacientes.length > 0 && (
+        <div className="overflow-x-auto rounded-xl border border-gray-200 shadow-sm">
+          <table className="min-w-full divide-y divide-gray-200 bg-white text-sm">
+            <thead className="bg-gray-50">
+              <tr>
+                <th className="px-6 py-3 text-left font-semibold text-gray-600">Nombre</th>
+                <th className="px-6 py-3 text-left font-semibold text-gray-600">Especie</th>
+                <th className="px-6 py-3 text-left font-semibold text-gray-600">Raza</th>
+                <th className="px-6 py-3 text-left font-semibold text-gray-600">Edad</th>
+                <th className="px-6 py-3 text-left font-semibold text-gray-600">Estado</th>
+                {isAdmin && (
+                  <th className="px-6 py-3 text-left font-semibold text-gray-600">Acciones</th>
+                )}
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-gray-100">
+              {pacientes.map(p => (
+                <tr key={p.id} className="hover:bg-gray-50 transition-colors">
+                  <td className="px-6 py-4 font-medium text-gray-900">{p.nombre}</td>
+                  <td className="px-6 py-4"><EspeciaBadge especie={p.especie} /></td>
+                  <td className="px-6 py-4 text-gray-600">{p.raza ?? '—'}</td>
+                  <td className="px-6 py-4 text-gray-600">
+                    {p.edad_meses < 12
+                      ? `${p.edad_meses} mes${p.edad_meses !== 1 ? 'es' : ''}`
+                      : `${Math.floor(p.edad_meses / 12)} año${Math.floor(p.edad_meses / 12) !== 1 ? 's' : ''}`
+                    }
+                  </td>
+                  <td className="px-6 py-4">
+                    <span className={`text-xs px-2 py-0.5 rounded-full font-medium ${
+                      p.activo ? 'bg-green-100 text-green-700' : 'bg-gray-100 text-gray-500'
+                    }`}>
+                      {p.activo ? 'Activo' : 'Inactivo'}
+                    </span>
+                  </td>
+                  {isAdmin && (
+                    <td className="px-6 py-4">
+                      <button
+                        onClick={() => { if (confirm(`¿Eliminar a ${p.nombre}?`)) eliminar(p.id) }}
+                        className="text-red-600 hover:text-red-800 text-xs font-medium min-h-[44px] px-2"
+                        aria-label={`Eliminar paciente ${p.nombre}`}
+                      >
+                        Eliminar
+                      </button>
+                    </td>
+                  )}
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </div>
+  )
+}
+```
+
+**`src/app/pacientes/nuevo/page.tsx`**
+
+```tsx
+'use client'
+import { useState, FormEvent } from 'react'
+import { useRouter } from 'next/navigation'
+import { useAuth } from '@/hooks/useAuth'
+import { usePacientes } from '@/hooks/usePacientes'
+import RoleGuard from '@/components/RoleGuard'
+
+export default function NuevoPacientePage() {
+  const { session } = useAuth()
+  const { crear } = usePacientes()
+  const router = useRouter()
+
+  const [nombre,    setNombre]    = useState('')
+  const [especie,   setEspecie]   = useState('')
+  const [raza,      setRaza]      = useState('')
+  const [edadMeses, setEdadMeses] = useState(0)
+  const [error,     setError]     = useState<string | null>(null)
+  const [enviando,  setEnviando]  = useState(false)
+
+  async function handleSubmit(e: FormEvent) {
+    e.preventDefault()
+    if (!session) return
+    setError(null)
+    setEnviando(true)
+    try {
+      await crear({
+        nombre,
+        especie,
+        raza:       raza || null,
+        edad_meses: edadMeses,
+        owner_id:   session.id,
+        vet_id:     session.user_role === 'vet' ? session.id : null,
+        activo:     true,
+      })
+      router.push('/pacientes')
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Error al crear el paciente.')
+    } finally {
+      setEnviando(false)
+    }
+  }
+
+  return (
+    <RoleGuard
+      roles={['admin', 'vet']}
+      fallback={
+        <div className="flex justify-center items-center min-h-[60vh]">
+          <p className="text-gray-500">No tienes permisos para acceder a esta página.</p>
+        </div>
+      }
+    >
+      <div className="max-w-lg mx-auto px-4 py-8">
+        <h1 className="text-2xl font-bold text-gray-900 mb-6">Nuevo paciente</h1>
+
+        <form onSubmit={handleSubmit} className="bg-white rounded-xl shadow-sm border p-6 flex flex-col gap-4">
+          <div>
+            <label htmlFor="nombre" className="block text-sm font-medium text-gray-700 mb-1">
+              Nombre del paciente *
+            </label>
+            <input id="nombre" type="text" value={nombre} onChange={e => setNombre(e.target.value)}
+              required className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-green-600"
+              placeholder="Firulais" />
+          </div>
+
+          <div>
+            <label htmlFor="especie" className="block text-sm font-medium text-gray-700 mb-1">
+              Especie *
+            </label>
+            <select id="especie" value={especie} onChange={e => setEspecie(e.target.value)}
+              required className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-green-600 bg-white">
+              <option value="">Seleccionar especie</option>
+              <option value="perro">Perro</option>
+              <option value="gato">Gato</option>
+              <option value="ave">Ave</option>
+              <option value="conejo">Conejo</option>
+              <option value="otro">Otro</option>
+            </select>
+          </div>
+
+          <div>
+            <label htmlFor="raza" className="block text-sm font-medium text-gray-700 mb-1">
+              Raza (opcional)
+            </label>
+            <input id="raza" type="text" value={raza} onChange={e => setRaza(e.target.value)}
+              className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-green-600"
+              placeholder="Labrador" />
+          </div>
+
+          <div>
+            <label htmlFor="edad" className="block text-sm font-medium text-gray-700 mb-1">
+              Edad (en meses) *
+            </label>
+            <input id="edad" type="number" min={0} value={edadMeses}
+              onChange={e => setEdadMeses(parseInt(e.target.value) || 0)} required
+              className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-green-600" />
+          </div>
+
+          {error && (
+            <p role="alert" className="text-red-600 text-sm bg-red-50 border border-red-200 rounded p-2">
+              {error}
+            </p>
+          )}
+
+          <div className="flex gap-3 pt-2">
+            <button type="button" onClick={() => router.push('/pacientes')}
+              className="flex-1 border border-gray-300 text-gray-700 py-2.5 rounded-lg text-sm font-medium hover:bg-gray-50 transition-colors min-h-[44px]">
+              Cancelar
+            </button>
+            <button type="submit" disabled={enviando}
+              className="flex-1 bg-green-700 text-white py-2.5 rounded-lg text-sm font-medium hover:bg-green-800 transition-colors disabled:opacity-50 disabled:cursor-not-allowed min-h-[44px]">
+              {enviando ? 'Guardando...' : 'Guardar paciente'}
+            </button>
+          </div>
+        </form>
+      </div>
+    </RoleGuard>
+  )
+}
+```
+
+> **Asignación de `vet_id`:** Si el usuario que crea el paciente tiene rol `vet`, se asigna automáticamente como veterinario responsable (`vet_id = session.id`). Esto es necesario para que las políticas RLS le permitan ver el paciente después.
+
+---
+
 **`src/app/admin/page.tsx`**
 
 ```tsx
 'use client'
+import { useEffect } from 'react'
+import { useRouter } from 'next/navigation'
+import { useAuth } from '@/hooks/useAuth'
+import { usePacientes } from '@/hooks/usePacientes'
 import RoleGuard from '@/components/RoleGuard'
 
 export default function AdminPage() {
+  const { session, isAuthenticated, loading } = useAuth()
+  const { pacientes, cargando } = usePacientes()
+  const router = useRouter()
+
+  useEffect(() => {
+    if (!loading && !isAuthenticated) router.replace('/login')
+  }, [loading, isAuthenticated, router])
+
+  const totalActivos   = pacientes.filter(p => p.activo).length
+  const totalInactivos = pacientes.length - totalActivos
+  const porEspecie     = pacientes.reduce<Record<string, number>>((acc, p) => {
+    acc[p.especie] = (acc[p.especie] ?? 0) + 1
+    return acc
+  }, {})
+
   return (
     <RoleGuard
       roles="admin"
       fallback={
-        <div className="text-center mt-20">
-          <h1 className="text-2xl font-bold text-red-600">Acceso Denegado</h1>
-          <p className="text-gray-500 mt-2">Solo los administradores pueden acceder aquí.</p>
+        <div className="flex justify-center items-center min-h-[60vh]">
+          <p className="text-gray-500">Acceso denegado. Solo administradores.</p>
         </div>
       }
     >
-      <div>
-        <h1 className="text-2xl font-bold text-green-800 mb-6">Panel de Administración</h1>
-        <div className="grid grid-cols-3 gap-4">
-          <div className="bg-white rounded-xl shadow p-6">
-            <h2 className="font-semibold text-gray-700">Gestión de Roles</h2>
-            <p className="text-sm text-gray-500 mt-1">Cambia el rol de los usuarios.</p>
-          </div>
-          <div className="bg-white rounded-xl shadow p-6">
-            <h2 className="font-semibold text-gray-700">Estadísticas</h2>
-            <p className="text-sm text-gray-500 mt-1">Métricas de la clínica.</p>
-          </div>
-          <div className="bg-white rounded-xl shadow p-6">
-            <h2 className="font-semibold text-gray-700">Todos los Pacientes</h2>
-            <p className="text-sm text-gray-500 mt-1">Vista completa sin filtro.</p>
-          </div>
+      <div className="max-w-5xl mx-auto px-4 py-8">
+        <div className="mb-8">
+          <h1 className="text-2xl font-bold text-gray-900">Panel de Administración</h1>
+          <p className="text-sm text-gray-500 mt-1">
+            Sesión activa: <strong>{session?.email}</strong>
+            <span className="ml-2 bg-yellow-100 text-yellow-800 text-xs px-2 py-0.5 rounded-full font-semibold">
+              ADMIN
+            </span>
+          </p>
         </div>
+
+        {cargando ? (
+          <p className="text-gray-500" aria-live="polite">Cargando estadísticas...</p>
+        ) : (
+          <>
+            {/* Tarjetas de estadísticas */}
+            <div className="grid grid-cols-2 md:grid-cols-4 gap-4 mb-8">
+              <StatCard titulo="Total pacientes"    valor={pacientes.length} color="bg-blue-50 border-blue-200 text-blue-800" />
+              <StatCard titulo="Activos"            valor={totalActivos}     color="bg-green-50 border-green-200 text-green-800" />
+              <StatCard titulo="Inactivos"          valor={totalInactivos}   color="bg-gray-50 border-gray-200 text-gray-700" />
+              <StatCard titulo="Especies distintas" valor={Object.keys(porEspecie).length} color="bg-purple-50 border-purple-200 text-purple-800" />
+            </div>
+
+            {/* Distribución por especie */}
+            {Object.keys(porEspecie).length > 0 && (
+              <div className="bg-white rounded-xl border border-gray-200 shadow-sm p-6 mb-6">
+                <h2 className="text-base font-semibold text-gray-800 mb-4">Distribución por especie</h2>
+                <div className="flex flex-wrap gap-3">
+                  {Object.entries(porEspecie).map(([especie, cantidad]) => (
+                    <div key={especie} className="flex items-center gap-2 bg-gray-50 border rounded-lg px-4 py-2">
+                      <span className="text-sm font-medium text-gray-700 capitalize">{especie}</span>
+                      <span className="text-xs bg-gray-200 text-gray-600 rounded-full px-2 py-0.5 font-bold">{cantidad}</span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {/* Gestión de roles */}
+            <div className="bg-yellow-50 border border-yellow-200 rounded-xl p-4 text-sm text-yellow-800">
+              <strong>Gestión de roles:</strong> Para cambiar el rol de un usuario, ejecuta en el SQL Editor de Supabase:
+              <code className="block mt-2 bg-yellow-100 rounded p-2 font-mono text-xs">
+                UPDATE public.profiles SET role = 'vet' WHERE id = 'uuid-del-usuario';
+              </code>
+              El cambio aplica en el próximo login (el JWT se renueva con el nuevo rol).
+            </div>
+          </>
+        )}
       </div>
     </RoleGuard>
+  )
+}
+
+function StatCard({ titulo, valor, color }: { titulo: string; valor: number; color: string }) {
+  return (
+    <div className={`rounded-xl border p-4 ${color}`}>
+      <p className="text-2xl font-bold">{valor}</p>
+      <p className="text-xs mt-0.5 opacity-80">{titulo}</p>
+    </div>
   )
 }
 ```
@@ -1142,11 +1682,12 @@ VALUES
 | Acción a probar | Resultado esperado | Resultado obtenido | OK? |
 |---|---|---|---|
 | Login con `owner@vetapp.com` | Redirige a `/pacientes`. Ve solo sus mascotas. | | |
-| `owner` visita `/admin` directamente | Redirige a `/pacientes` (middleware bloquea). | | |
+| `owner` visita `/admin` directamente | Redirige a `/pacientes` (proxy bloquea). | | |
 | Login con `vet@vetapp.com` | Ve botón "+ Nuevo". No ve panel Admin. | | |
 | Login con `admin@vetapp.com` | Ve TODOS los pacientes + enlace "Admin Panel". | | |
 | `owner` intenta ver paciente de otro owner (API) | Supabase devuelve 0 resultados (RLS). | | |
-| Cerrar sesión y visitar `/pacientes` | Redirige a `/login` (middleware). | | |
+| Cerrar sesión y visitar `/pacientes` | Redirige a `/login` (proxy). | | |
+| Registrar cuenta nueva en `/registro` | Rol asignado = `owner`. Redirige al login tras 3 s. | | |
 
 ---
 
@@ -1176,7 +1717,7 @@ VALUES
 │     → session.user_role = 'admin' → isAdmin = true       │
 │         │                                                │
 │         ▼                                                │
-│  7. middleware lee JWT → permite /admin si rol correcto   │
+│  7. proxy.ts lee JWT → permite /admin si rol correcto     │
 │         │                                                │
 │         ▼                                                │
 │  8. pacienteService.listar() → RLS evalúa user_role      │
